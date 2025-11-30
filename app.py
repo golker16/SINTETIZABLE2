@@ -32,7 +32,6 @@ from PySide6.QtWidgets import (
     QGroupBox,
 )
 
-
 # ----------------- DEFAULTS -----------------
 
 FMIN_NOTE = "C2"
@@ -249,6 +248,70 @@ def one_pole_smooth(x: np.ndarray, alpha: float) -> np.ndarray:
     return y
 
 
+# ----------------- NEW HELPERS (NORMAL vs FLUIDO) -----------------
+
+def compute_activity(env_bands: np.ndarray, voiced: np.ndarray, thr: float = 0.02) -> np.ndarray:
+    """
+    Decide si hay 'algo sonando' por frame.
+    Usamos energía total (promedio de bandas) + voiced como respaldo.
+    """
+    env_total = np.mean(env_bands, axis=0).astype(np.float32)
+    act = env_total > float(thr)
+    if voiced is not None:
+        act = act | voiced.astype(bool)
+    return act.astype(bool)
+
+
+def hold_last_active_specenv(spec_env: np.ndarray, active: np.ndarray) -> np.ndarray:
+    """
+    Si no hay actividad, congelar el timbre al último frame activo.
+    """
+    spec_env = np.asarray(spec_env, np.float32).copy()
+    n = spec_env.shape[1]
+    if n == 0:
+        return spec_env
+    last = 0
+    for t in range(n):
+        if bool(active[t]):
+            last = t
+        else:
+            spec_env[:, t] = spec_env[:, last]
+    return spec_env
+
+
+def make_fluid_env(
+    env: np.ndarray,
+    active: np.ndarray,
+    floor: float,
+    influence: float,
+    alpha: float = 0.05,
+    unvoiced_influence_mul: float = 0.25,
+) -> np.ndarray:
+    """
+    Env 'fluido' (azul):
+    - Nunca cae a 0 (usa floor)
+    - Sigue un poco la dinámica real (influence)
+    - En frames no-activos, baja la influencia para no "respirar" de más.
+    """
+    env = np.asarray(env, np.float32)
+    active = np.asarray(active, bool)
+
+    e = one_pole_smooth(env, alpha=alpha).astype(np.float32)
+
+    infl = float(np.clip(influence, 0.0, 1.0))
+    flo = float(np.clip(floor, 0.0, 1.0))
+
+    infl_vec = np.full_like(e, infl, dtype=np.float32)
+    infl_vec[~active] *= float(np.clip(unvoiced_influence_mul, 0.0, 1.0))
+
+    out = flo + infl_vec * e
+    out = np.clip(out, 0.0, 1.0).astype(np.float32)
+
+    # un pelín más de suavizado para que no haya escalones
+    out = one_pole_smooth(out, alpha=alpha).astype(np.float32)
+    return out
+
+
 def smooth_freq_logmag(logmag: np.ndarray, smooth_bins: int) -> np.ndarray:
     smooth_bins = int(max(1, smooth_bins))
     if smooth_bins <= 1:
@@ -290,6 +353,7 @@ def extract_f0_multiband_env_and_specenv(
     if len(valid) == 0:
         raise RuntimeError("No se pudo detectar pitch (F0) en el audio fuente.")
 
+    # hold-last pitch (ya)
     f0_clean = f0.copy()
     last = f0_clean[valid[0]]
     for i in range(len(f0_clean)):
@@ -344,7 +408,11 @@ def extract_f0_multiband_env_and_specenv(
     for bi in range(4):
         env_bands[bi] = one_pole_smooth(env_bands[bi], alpha=env_smooth_alpha)
 
-    return f0_clean, voiced, env_bands, spec_env
+    # ✅ actividad + freeze timbre en silencio
+    active = compute_activity(env_bands, voiced, thr=0.02)
+    spec_env = hold_last_active_specenv(spec_env, active)
+
+    return f0_clean.astype(np.float32), voiced, env_bands.astype(np.float32), spec_env.astype(np.float32), active
 
 
 def spectral_envelope_match(
@@ -413,6 +481,31 @@ def list_audio_files(folder: str):
     return files
 
 
+def make_out_roots_for_single(out_target: str, input_file: str):
+    """
+    Devuelve root sin extensión, para crear:
+      root + "__normal.wav"
+      root + "__fluido.wav"
+    Acepta:
+      - out_target carpeta existente: usa base del input
+      - out_target ruta a .wav: usa esa ruta sin .wav como root
+      - out_target sin .wav: lo trata como carpeta y la crea
+    """
+    out_target = out_target.strip()
+    base = os.path.splitext(os.path.basename(input_file))[0]
+
+    if os.path.isdir(out_target):
+        root = os.path.join(out_target, base)
+    elif out_target.lower().endswith(".wav"):
+        root = out_target[:-4]
+    else:
+        # lo tratamos como carpeta
+        os.makedirs(out_target, exist_ok=True)
+        root = os.path.join(out_target, base)
+
+    return root
+
+
 # ----------------- WORKER -----------------
 
 class AudioWorker(QObject):
@@ -467,6 +560,12 @@ class AudioWorker(QObject):
 
         self._mipmap_cache = {}
 
+        # FLUID preset (hardcode como pediste)
+        self._fluid_floor = 0.18
+        self._fluid_influence = 0.35
+        self._fluid_alpha = 0.06
+        self._fluid_unvoiced_mul = 0.15
+
     def _load_mipmaps_cached(self, wt_path: str):
         wt_path = os.path.abspath(wt_path)
         mm = self._mipmap_cache.get(wt_path)
@@ -477,13 +576,16 @@ class AudioWorker(QObject):
         self._mipmap_cache[wt_path] = mipmaps
         return mipmaps
 
-    def _process_one(self, src_file: str, out_file: str, wavetable_files: list, rng: np.random.Generator):
+    def _process_one(self, src_file: str, out_root: str, wavetable_files: list, rng: np.random.Generator):
+        out_normal = out_root + "__normal.wav"
+        out_fluido = out_root + "__fluido.wav"
+
         self.log.emit(f"Fuente: {os.path.basename(src_file)}")
         y, sr = load_mono(src_file)
         self.log.emit(f"  len={len(y)} sr={sr}")
 
         self.log.emit("  Analizando: F0 + multiband env + spectral envelope...")
-        f0_frames, voiced, env_bands, spec_env = extract_f0_multiband_env_and_specenv(
+        f0_frames, voiced, env_bands, spec_env, active = extract_f0_multiband_env_and_specenv(
             y=y,
             sr=sr,
             frame_length=self.frame_length,
@@ -494,8 +596,11 @@ class AudioWorker(QObject):
             spec_smooth_bins=self.spec_smooth_bins,
         )
 
+        # Elegimos 4 wavetables UNA vez (mismo set para normal y fluido)
         picks = rng.choice(wavetable_files, size=4, replace=(len(wavetable_files) < 4))
-        layers = []
+
+        layers_normal = []
+        layers_fluido = []
 
         for i in range(4):
             wt = str(picks[i])
@@ -504,9 +609,19 @@ class AudioWorker(QObject):
             pos = float(rng.uniform(self.pos_min, self.pos_max))
             mip = float(rng.uniform(self.mip_min, self.mip_max))
 
-            layer = synth_wavetable_from_f0_env(
+            env_normal = env_bands[i]
+            env_fluid = make_fluid_env(
+                env=env_bands[i],
+                active=active,
+                floor=self._fluid_floor,
+                influence=self._fluid_influence,
+                alpha=self._fluid_alpha,
+                unvoiced_influence_mul=self._fluid_unvoiced_mul,
+            )
+
+            layer_n = synth_wavetable_from_f0_env(
                 f0_frames_hz=f0_frames,
-                env_frames=env_bands[i],
+                env_frames=env_normal,
                 sr=sr,
                 n_samples=len(y),
                 frame_length=self.frame_length,
@@ -515,17 +630,52 @@ class AudioWorker(QObject):
                 position=pos,
                 mip_strength=mip,
             )
-            layers.append(layer)
-            self.log.emit(f"  Layer {i+1}: {os.path.basename(wt)} | pos={pos:.2f} mip={mip:.2f}")
+            layer_f = synth_wavetable_from_f0_env(
+                f0_frames_hz=f0_frames,
+                env_frames=env_fluid,
+                sr=sr,
+                n_samples=len(y),
+                frame_length=self.frame_length,
+                hop_length=self.hop_length,
+                mipmaps=mipmaps,
+                position=pos,
+                mip_strength=mip,
+            )
 
-        mix = np.sum(np.stack(layers, axis=0), axis=0).astype(np.float32)
-        mx = float(np.max(np.abs(mix)) + 1e-12)
-        mix = (mix / mx * 0.95).astype(np.float32)
+            layers_normal.append(layer_n)
+            layers_fluido.append(layer_f)
+
+            self.log.emit(
+                f"  Layer {i+1}: {os.path.basename(wt)} | pos={pos:.2f} mip={mip:.2f}"
+                f" | fluid(floor={self._fluid_floor:.2f}, infl={self._fluid_influence:.2f})"
+            )
+
+        # Mix NORMAL
+        mix_n = np.sum(np.stack(layers_normal, axis=0), axis=0).astype(np.float32)
+        mx = float(np.max(np.abs(mix_n)) + 1e-12)
+        mix_n = (mix_n / mx * 0.95).astype(np.float32)
+
+        # Mix FLUIDO
+        mix_f = np.sum(np.stack(layers_fluido, axis=0), axis=0).astype(np.float32)
+        mx = float(np.max(np.abs(mix_f)) + 1e-12)
+        mix_f = (mix_f / mx * 0.95).astype(np.float32)
 
         if self.enable_spec_match:
-            self.log.emit("  Aplicando spectral envelope match (timbre)...")
-            mix = spectral_envelope_match(
-                y_syn=mix,
+            self.log.emit("  Aplicando spectral envelope match (timbre) a NORMAL...")
+            mix_n = spectral_envelope_match(
+                y_syn=mix_n,
+                sr=sr,
+                spec_env_src=spec_env,
+                frame_length=self.frame_length,
+                hop_length=self.hop_length,
+                spec_smooth_bins=self.spec_smooth_bins,
+                strength=self.spec_strength,
+                clamp_lo=self.spec_clamp_lo,
+                clamp_hi=self.spec_clamp_hi,
+            )
+            self.log.emit("  Aplicando spectral envelope match (timbre) a FLUIDO...")
+            mix_f = spectral_envelope_match(
+                y_syn=mix_f,
                 sr=sr,
                 spec_env_src=spec_env,
                 frame_length=self.frame_length,
@@ -537,14 +687,19 @@ class AudioWorker(QObject):
             )
 
         if self.output_gain != 1.0:
-            mix = np.clip(mix * float(self.output_gain), -1.0, 1.0).astype(np.float32)
+            mix_n = np.clip(mix_n * float(self.output_gain), -1.0, 1.0).astype(np.float32)
+            mix_f = np.clip(mix_f * float(self.output_gain), -1.0, 1.0).astype(np.float32)
 
-        out_dir = os.path.dirname(out_file)
-        if out_dir and not os.path.isdir(out_dir):
-            os.makedirs(out_dir, exist_ok=True)
+        # crear carpeta si hace falta
+        for out_file in (out_normal, out_fluido):
+            out_dir = os.path.dirname(out_file)
+            if out_dir and not os.path.isdir(out_dir):
+                os.makedirs(out_dir, exist_ok=True)
 
-        sf.write(out_file, mix, sr)
-        self.log.emit(f"  Guardado: {out_file}")
+        sf.write(out_normal, mix_n, sr)
+        sf.write(out_fluido, mix_f, sr)
+        self.log.emit(f"  Guardado NORMAL: {out_normal}")
+        self.log.emit(f"  Guardado FLUIDO: {out_fluido}")
 
     def run(self):
         try:
@@ -555,7 +710,7 @@ class AudioWorker(QObject):
             if len(wavetable_files) == 0:
                 raise RuntimeError("No se encontraron .wav en la carpeta de wavetables (incl. subcarpetas).")
 
-            # ✅ RNG: si seed=0 => azar total (entropy del sistema)
+            # RNG: si seed=0 => azar total (entropy del sistema)
             rng = np.random.default_rng(None if self.seed == 0 else self.seed)
 
             is_batch = os.path.isdir(inp)
@@ -565,23 +720,14 @@ class AudioWorker(QObject):
                 if not os.path.isfile(inp):
                     raise RuntimeError("Input single debe ser un archivo.")
 
-                # Si output es carpeta, guardamos ahí con nombre automático
-                if os.path.isdir(outp):
-                    base = os.path.splitext(os.path.basename(inp))[0]
-                    out_file = os.path.join(outp, base + "__restored.wav")
-                else:
-                    # si no tiene extensión, asumimos carpeta y la creamos
-                    if os.path.splitext(outp)[1].lower() != ".wav":
-                        os.makedirs(outp, exist_ok=True)
-                        base = os.path.splitext(os.path.basename(inp))[0]
-                        out_file = os.path.join(outp, base + "__restored.wav")
-                    else:
-                        out_file = outp
+                out_root = make_out_roots_for_single(outp, inp)
 
                 self.progress.emit(5)
                 self.log.emit("=== PROCESO SINGLE ===")
-                self.log.emit(f"Wavetable dir: {self.wt_dir} | count={len(wavetable_files)} | seed={'RANDOM' if self.seed==0 else self.seed}")
-                self._process_one(inp, out_file, wavetable_files, rng)
+                self.log.emit(
+                    f"Wavetable dir: {self.wt_dir} | count={len(wavetable_files)} | seed={'RANDOM' if self.seed==0 else self.seed}"
+                )
+                self._process_one(inp, out_root, wavetable_files, rng)
                 self.progress.emit(100)
                 self.finished.emit()
                 return
@@ -603,20 +749,22 @@ class AudioWorker(QObject):
             self.log.emit("=== PROCESO BATCH ===")
             self.log.emit(f"Input: {in_dir}")
             self.log.emit(f"Output: {out_dir}")
-            self.log.emit(f"Wavetable dir: {self.wt_dir} | count={len(wavetable_files)} | seed={'RANDOM' if self.seed==0 else self.seed}")
+            self.log.emit(
+                f"Wavetable dir: {self.wt_dir} | count={len(wavetable_files)} | seed={'RANDOM' if self.seed==0 else self.seed}"
+            )
             self.progress.emit(1)
 
             total = len(files)
             for idx, src_file in enumerate(files):
                 base = os.path.splitext(os.path.basename(src_file))[0]
-                out_file = os.path.join(out_dir, base + "__restored.wav")
+                out_root = os.path.join(out_dir, base)
 
                 self.log.emit(f"\n[{idx+1}/{total}]")
                 p = int(5 + 90 * (idx / max(1, total)))
                 self.progress.emit(p)
 
-                # ✅ RNG continuo: completamente random a lo largo del batch
-                self._process_one(src_file, out_file, wavetable_files, rng)
+                # RNG continuo: completamente random a lo largo del batch
+                self._process_one(src_file, out_root, wavetable_files, rng)
 
             self.progress.emit(100)
             self.finished.emit()
@@ -630,7 +778,7 @@ class AudioWorker(QObject):
 class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("Restaurador por Síntesis (4 bandas + timbre match) — Random REAL")
+        self.setWindowTitle("Restaurador por Síntesis (4 bandas + timbre match) — NORMAL/FLUIDO")
         self.resize(980, 720)
 
         central = QWidget()
@@ -814,7 +962,7 @@ class MainWindow(QMainWindow):
         layout.addWidget(gb_sm)
 
         # Process
-        self.btn_process = QPushButton("Procesar")
+        self.btn_process = QPushButton("Procesar (exporta __normal.wav y __fluido.wav)")
         self.btn_process.clicked.connect(self.start_processing)
         layout.addWidget(self.btn_process)
 
@@ -853,7 +1001,7 @@ class MainWindow(QMainWindow):
 
     def pick_output_file(self):
         path, _ = QFileDialog.getSaveFileName(
-            self, "Guardar salida", "resultado__restored.wav", "WAV (*.wav);;Todos (*.*)"
+            self, "Guardar salida (root)", "resultado.wav", "WAV (*.wav);;Todos (*.*)"
         )
         if path:
             self.out_edit.setText(path)
@@ -937,7 +1085,7 @@ class MainWindow(QMainWindow):
 
     def on_done(self):
         self.btn_process.setEnabled(True)
-        QMessageBox.information(self, "Listo", "Proceso completado.")
+        QMessageBox.information(self, "Listo", "Proceso completado (NORMAL + FLUIDO).")
 
     def on_err(self, msg: str):
         self.btn_process.setEnabled(True)
@@ -953,4 +1101,3 @@ if __name__ == "__main__":
     w = MainWindow()
     w.show()
     sys.exit(app.exec())
-
