@@ -1,18 +1,16 @@
 import sys
 import os
-import tempfile
+import glob
 import numpy as np
 import soundfile as sf
 
-# librosa imports mínimos (sin importar librosa “entero”)
+# librosa imports mínimos (sin sklearn)
 from librosa.core.audio import load as lr_load
 from librosa.core.pitch import pyin as lr_pyin
-from librosa.core.convert import note_to_hz as lr_note_to_hz, hz_to_midi as lr_hz_to_midi
+from librosa.core.convert import note_to_hz as lr_note_to_hz
+from librosa.core.spectrum import stft as lr_stft, istft as lr_istft
 
-from PySide6.QtCore import QObject, QThread, Signal, Qt, QUrl
-from PySide6.QtGui import QKeySequence, QShortcut
-from PySide6.QtMultimedia import QMediaPlayer, QAudioOutput
-
+from PySide6.QtCore import QObject, QThread, Signal, Qt
 from PySide6.QtWidgets import (
     QApplication,
     QMainWindow,
@@ -31,47 +29,38 @@ from PySide6.QtWidgets import (
     QSpinBox,
     QDoubleSpinBox,
     QCheckBox,
-    QListWidget,
-    QListWidgetItem,
-    QSplitter,
+    QComboBox,
     QGroupBox,
 )
-
-
-from matplotlib.backends.backend_qtagg import FigureCanvasQTAgg as FigureCanvas
-from matplotlib.figure import Figure
 
 
 # ----------------- DEFAULTS -----------------
 
 FMIN_NOTE = "C2"
 FMAX_NOTE = "C7"
+
 DEFAULT_FRAME_LENGTH = 2048
 DEFAULT_HOP_LENGTH = 256
 
 WT_FRAME_SIZE = 2048
 WT_MIP_LEVELS = 8
 
-# Tu carpeta fija (pero puedes cambiarla en la UI también)
 WT_DIR_DEFAULT = r"D:\WAVETABLE"
 
+AUDIO_EXTS = (".wav", ".flac", ".ogg", ".mp3", ".aiff", ".aif", ".m4a")
 
-# ----------------- WAVETABLE (drop-in) -----------------
+
+# ----------------- WAVETABLE OSC -----------------
 
 def _to_mono_float(x: np.ndarray) -> np.ndarray:
     x = np.asarray(x)
     if x.ndim == 2:
         x = np.mean(x, axis=1)
     x = x.astype(np.float32, copy=False)
-    # normalizar si viene en int
-    if np.issubdtype(x.dtype, np.integer):
-        mx = np.iinfo(x.dtype).max
-        x = x.astype(np.float32) / float(mx)
     return x
 
 
 def _fade_edges(frame: np.ndarray, fade: int = 8) -> np.ndarray:
-    """Suaviza los bordes del ciclo para reducir clicks si el ciclo no cierra perfecto."""
     if fade <= 0 or 2 * fade >= len(frame):
         return frame
     w = np.linspace(0.0, 1.0, fade, dtype=np.float32)
@@ -87,7 +76,6 @@ def _normalize_frame(frame: np.ndarray) -> np.ndarray:
 
 
 def _linear_resample(x: np.ndarray, new_len: int) -> np.ndarray:
-    """Resample lineal 1D: suficiente para precomputar mipmaps sin dependencias extras."""
     n = len(x)
     if new_len == n:
         return x.astype(np.float32, copy=False)
@@ -101,25 +89,15 @@ def load_wavetable_wav(
     frame_size: int = WT_FRAME_SIZE,
     normalize_each_frame: bool = True,
     edge_fade: int = 8,
-):
-    """
-    Carga WAV mono.
-    - Si el WAV tiene longitud == frame_size -> 1 frame
-    - Si el WAV tiene longitud múltiplo de frame_size -> multi-frame concatenado
-    Retorna: frames shape = (n_frames, frame_size) float32
-    """
-    audio, sr = sf.read(path, always_2d=False)
+) -> np.ndarray:
+    audio, _sr = sf.read(path, always_2d=False)
     audio = _to_mono_float(audio)
     n = len(audio)
 
     if n < frame_size:
         audio = np.pad(audio, (0, frame_size - n))
-        n = len(audio)
 
-    n_frames = n // frame_size
-    if n_frames < 1:
-        n_frames = 1
-
+    n_frames = max(1, len(audio) // frame_size)
     use_len = n_frames * frame_size
     audio = audio[:use_len]
 
@@ -127,8 +105,8 @@ def load_wavetable_wav(
 
     for i in range(n_frames):
         f = frames[i]
-        f = f - np.mean(f)            # quitar DC
-        f = _fade_edges(f, edge_fade) # opcional
+        f = f - np.mean(f)
+        f = _fade_edges(f, edge_fade)
         if normalize_each_frame:
             f = _normalize_frame(f)
         frames[i] = f
@@ -137,10 +115,6 @@ def load_wavetable_wav(
 
 
 def build_wavetable_mipmaps(frames: np.ndarray, levels: int = WT_MIP_LEVELS):
-    """
-    Crea mipmaps por downsampling de la tabla (reduce armónicos).
-    Retorna lista mipmaps[level] con shape=(n_frames, frame_size_level)
-    """
     frames = np.asarray(frames, dtype=np.float32)
     n_frames, frame_size = frames.shape
 
@@ -150,15 +124,12 @@ def build_wavetable_mipmaps(frames: np.ndarray, levels: int = WT_MIP_LEVELS):
 
     for _lvl in range(levels):
         mipmaps.append(cur)
-
         next_size = max(32, cur_size // 2)
         if next_size == cur_size:
             break
-
         nxt = np.zeros((n_frames, next_size), dtype=np.float32)
         for fi in range(n_frames):
             nxt[fi] = _linear_resample(cur[fi], next_size)
-
         cur = nxt
         cur_size = next_size
 
@@ -170,7 +141,6 @@ def _lerp(a, b, t):
 
 
 def _table_read_linear(table_1d: np.ndarray, phase: np.ndarray) -> np.ndarray:
-    """Lee una tabla 1D con fase [0,1), interpolación lineal."""
     n = len(table_1d)
     idx = phase * n
     i0 = np.floor(idx).astype(np.int32)
@@ -180,17 +150,13 @@ def _table_read_linear(table_1d: np.ndarray, phase: np.ndarray) -> np.ndarray:
 
 
 def render_wavetable_osc(
-    f0_hz: np.ndarray,          # por-sample
+    f0_hz: np.ndarray,
     sr: int,
-    mipmaps: list,              # salida de build_wavetable_mipmaps
-    position: float = 0.0,      # 0..1
+    mipmaps: list,
+    position: float = 0.0,
     phase0: float = 0.0,
-    mip_strength: float = 1.0,  # 0..1
+    mip_strength: float = 1.0,
 ):
-    """
-    Oscilador wavetable con morph entre frames + mipmaps simple.
-    Devuelve (audio, phase_final).
-    """
     f0_hz = np.asarray(f0_hz, dtype=np.float32)
     n_samples = len(f0_hz)
     n_levels = len(mipmaps)
@@ -211,18 +177,17 @@ def render_wavetable_osc(
         ph += float(f0_hz[i]) / float(sr)
         ph -= np.floor(ph)
 
+    # mip selector simple
     f_ref = 55.0
     ratio = np.maximum(f0_hz / f_ref, 1e-6)
     lvl_float = np.log2(ratio) * float(np.clip(mip_strength, 0.0, 1.0))
     lvl = np.clip(np.floor(lvl_float).astype(np.int32), 0, n_levels - 1)
 
     out = np.zeros(n_samples, dtype=np.float32)
-
     for L in range(n_levels):
         mask = (lvl == L)
         if not np.any(mask):
             continue
-
         tables_L = mipmaps[L]
         t0 = tables_L[f0i]
         t1 = tables_L[f1i]
@@ -265,62 +230,67 @@ def synth_wavetable_from_f0_env(
     )
 
     out = osc * env
-    out = np.clip(out, -1.0, 1.0).astype(np.float32, copy=False)
-    return out
+    return np.clip(out, -1.0, 1.0).astype(np.float32, copy=False)
 
 
-# ----------------- DSP (analysis) -----------------
+# ----------------- ANALYSIS (F0 + multiband env + spectral envelope) -----------------
 
 def load_mono(path: str):
     y, sr = lr_load(path, sr=None, mono=True)
     return y.astype(np.float32, copy=False), int(sr)
 
 
-def frame_rms(y: np.ndarray, frame_length: int, hop_length: int) -> np.ndarray:
-    y = np.asarray(y, dtype=float)
-    n = len(y)
-    if n < frame_length:
-        y = np.pad(y, (0, frame_length - n))
-        n = len(y)
-
-    n_frames = 1 + (n - frame_length) // hop_length
-    rms = np.empty(n_frames, dtype=float)
-
-    for i in range(n_frames):
-        start = i * hop_length
-        frame = y[start:start + frame_length]
-        rms[i] = np.sqrt(np.mean(frame * frame) + 1e-12)
-
-    return rms
-
-
 def one_pole_smooth(x: np.ndarray, alpha: float) -> np.ndarray:
     alpha = float(np.clip(alpha, 1e-6, 1.0))
-    y = np.empty_like(x, dtype=float)
+    y = np.empty_like(x, dtype=np.float32)
     y[0] = x[0]
     for i in range(1, len(x)):
         y[i] = alpha * x[i] + (1.0 - alpha) * y[i - 1]
     return y
 
 
-def extract_pitch_voicing_and_env(
+def smooth_freq_logmag(logmag: np.ndarray, smooth_bins: int) -> np.ndarray:
+    """
+    logmag: shape (n_bins, n_frames)
+    smoothing 1D en frecuencia por frame (moving avg).
+    """
+    smooth_bins = int(max(1, smooth_bins))
+    if smooth_bins <= 1:
+        return logmag
+
+    k = smooth_bins
+    kernel = np.ones(k, dtype=np.float32) / float(k)
+
+    # pad reflect en bins
+    pad = k // 2
+    padded = np.pad(logmag, ((pad, pad), (0, 0)), mode="reflect")
+
+    out = np.empty_like(logmag, dtype=np.float32)
+    # convolve por frame (bins axis)
+    for t in range(logmag.shape[1]):
+        out[:, t] = np.convolve(padded[:, t], kernel, mode="valid").astype(np.float32)
+    return out
+
+
+def extract_f0_multiband_env_and_specenv(
     y: np.ndarray,
     sr: int,
     frame_length: int,
     hop_length: int,
-    env_smooth_alpha: float,
     f0_smooth_alpha: float,
+    env_smooth_alpha: float,
     gate_unvoiced: bool,
+    spec_smooth_bins: int,
 ):
-    f0, voiced_flag, voiced_prob = lr_pyin(
+    # ---- F0 (pyin) ----
+    f0, voiced_flag, _voiced_prob = lr_pyin(
         y,
         fmin=lr_note_to_hz(FMIN_NOTE),
         fmax=lr_note_to_hz(FMAX_NOTE),
         frame_length=frame_length,
         hop_length=hop_length,
     )
-
-    f0 = np.asarray(f0, dtype=float)
+    f0 = np.asarray(f0, dtype=np.float32)
     voiced = np.asarray(voiced_flag, dtype=bool)
 
     valid = np.where(~np.isnan(f0))[0]
@@ -337,45 +307,133 @@ def extract_pitch_voicing_and_env(
 
     f0_clean = one_pole_smooth(f0_clean, alpha=f0_smooth_alpha)
 
-    env = frame_rms(y, frame_length=frame_length, hop_length=hop_length)
-    env = env / (np.max(env) + 1e-12)
+    # ---- STFT magnitude ----
+    n_fft = frame_length
+    S = lr_stft(y.astype(np.float32), n_fft=n_fft, hop_length=hop_length, win_length=frame_length, center=True)
+    mag = np.abs(S).astype(np.float32)
+    n_bins, n_frames = mag.shape
 
-    # ✅ ALIGN
-    n = min(len(f0_clean), len(voiced), len(env))
+    # ---- multiband env (4 bandas) ----
+    freqs = np.linspace(0.0, sr / 2.0, n_bins, dtype=np.float32)
+
+    # Bandas (puedes ajustar luego)
+    edges = [
+        (20.0, 140.0),     # low
+        (140.0, 700.0),    # lowmid
+        (700.0, 4000.0),   # highmid
+        (4000.0, min(16000.0, sr / 2.0 - 1.0)),  # high
+    ]
+
+    env_bands = np.zeros((4, n_frames), dtype=np.float32)
+    for bi, (lo, hi) in enumerate(edges):
+        mask = (freqs >= lo) & (freqs < hi)
+        if not np.any(mask):
+            continue
+        band_mag = mag[mask, :]  # (bins_in_band, frames)
+        # RMS en frecuencia
+        env = np.sqrt(np.mean(band_mag * band_mag, axis=0) + 1e-12).astype(np.float32)
+        # normalize por banda
+        env = env / (np.max(env) + 1e-12)
+        # gate por voiced si quieres
+        if gate_unvoiced:
+            # alineamos luego, pero podemos gatear aquí si ya cuadra
+            pass
+        env_bands[bi] = env
+
+    # ---- spectral envelope (timbre) por frame ----
+    logmag = np.log(mag + 1e-8).astype(np.float32)
+    spec_env_log = smooth_freq_logmag(logmag, smooth_bins=spec_smooth_bins)
+    spec_env = np.exp(spec_env_log).astype(np.float32)  # vuelve a magnitudes suaves
+
+    # ---- ALIGN frames entre pyin y stft ----
+    n = min(len(f0_clean), len(voiced), n_frames)
     f0_clean = f0_clean[:n]
     voiced = voiced[:n]
-    env = env[:n]
+    env_bands = env_bands[:, :n]
+    spec_env = spec_env[:, :n]
 
     if gate_unvoiced:
-        env = env * voiced.astype(float)
+        v = voiced.astype(np.float32)
+        env_bands = env_bands * v[None, :]
 
-    env = one_pole_smooth(env, alpha=env_smooth_alpha)
+    # suavizado temporal de env por banda
+    for bi in range(4):
+        env_bands[bi] = one_pole_smooth(env_bands[bi], alpha=env_smooth_alpha)
 
-    return f0_clean.astype(np.float32), voiced, env.astype(np.float32)
+    return f0_clean, voiced, env_bands, spec_env
 
 
-# ----------------- PLOT -----------------
+def spectral_envelope_match(
+    y_syn: np.ndarray,
+    sr: int,
+    spec_env_src: np.ndarray,   # (bins, frames), suave
+    frame_length: int,
+    hop_length: int,
+    spec_smooth_bins: int,
+    strength: float,
+    clamp_lo: float,
+    clamp_hi: float,
+):
+    """
+    Aplica “EQ dinámica” para que el timbre del synth se acerque al timbre del original.
+    """
+    strength = float(np.clip(strength, 0.0, 1.0))
+    if strength <= 0.0:
+        return y_syn
 
-class PitchPlotCanvas(FigureCanvas):
-    def __init__(self, parent=None):
-        fig = Figure(figsize=(5, 2))
-        self.ax = fig.add_subplot(111)
-        super().__init__(fig)
-        self.setParent(parent)
-        self.setMinimumHeight(170)
+    n_fft = frame_length
+    S = lr_stft(y_syn.astype(np.float32), n_fft=n_fft, hop_length=hop_length, win_length=frame_length, center=True)
+    mag = np.abs(S).astype(np.float32)
+    phase = np.angle(S).astype(np.float32)
 
-    def plot_midi(self, midi_curve: np.ndarray):
-        self.ax.clear()
-        self.ax.plot(midi_curve, linewidth=1)
-        self.ax.set_title("Curva de afinación (MIDI)")
-        self.ax.set_xlabel("Frame")
-        self.ax.set_ylabel("Nota MIDI")
-        self.ax.grid(True, alpha=0.3)
-        self.draw()
+    logmag = np.log(mag + 1e-8).astype(np.float32)
+    spec_env_syn_log = smooth_freq_logmag(logmag, smooth_bins=spec_smooth_bins)
+    spec_env_syn = np.exp(spec_env_syn_log).astype(np.float32)
 
-    def clear_plot(self):
-        self.ax.clear()
-        self.draw()
+    # ALIGN frames/bins por seguridad
+    bins = min(spec_env_src.shape[0], spec_env_syn.shape[0], mag.shape[0])
+    frames = min(spec_env_src.shape[1], spec_env_syn.shape[1], mag.shape[1])
+
+    src = spec_env_src[:bins, :frames]
+    syn = spec_env_syn[:bins, :frames]
+    mag_use = mag[:bins, :frames]
+    ph_use = phase[:bins, :frames]
+
+    G = src / (syn + 1e-12)
+    G = np.clip(G, float(clamp_lo), float(clamp_hi)).astype(np.float32)
+
+    # strength: mezcla en log (más estable)
+    # mag_out = mag * (G ** strength)
+    mag_out = mag_use * np.power(G, strength).astype(np.float32)
+
+    # reconstrucción
+    S_out = mag_out * (np.cos(ph_use) + 1j * np.sin(ph_use))
+
+    y_out = lr_istft(S_out, hop_length=hop_length, win_length=frame_length, center=True, length=len(y_syn))
+    y_out = np.asarray(y_out, dtype=np.float32)
+    return np.clip(y_out, -1.0, 1.0).astype(np.float32, copy=False)
+
+
+# ----------------- RANDOM WAVETABLE PICK -----------------
+
+def list_wav_files(folder: str):
+    if not folder or not os.path.isdir(folder):
+        return []
+    files = []
+    for ext in ("*.wav", "*.WAV"):
+        files.extend(glob.glob(os.path.join(folder, ext)))
+    files.sort(key=lambda p: p.lower())
+    return files
+
+
+def stable_seed_from_path(path: str) -> int:
+    # seed estable por archivo (para batch reproducible si seed=0)
+    s = os.path.abspath(path).lower()
+    h = 2166136261
+    for ch in s:
+        h ^= ord(ch)
+        h = (h * 16777619) & 0xFFFFFFFF
+    return int(h)
 
 
 # ----------------- WORKER -----------------
@@ -385,92 +443,203 @@ class AudioWorker(QObject):
     log = Signal(str)
     finished = Signal()
     error = Signal(str)
-    pitch_midi = Signal(object)
 
     def __init__(
         self,
-        src_path: str,
-        out_path: str,
+        input_path: str,
+        output_path: str,
+        mode: str,  # "single" | "batch"
+        wt_dir: str,
+        seed: int,
+        pos_min: float,
+        pos_max: float,
+        mip_min: float,
+        mip_max: float,
         hop_length: int,
         frame_length: int,
         env_alpha: float,
         f0_alpha: float,
         gate_unvoiced: bool,
         output_gain: float,
-        wavetable_path: str,
-        wt_position: float,
-        wt_mip_strength: float,
+        # spectral match
+        enable_spec_match: bool,
+        spec_strength: float,
+        spec_smooth_bins: int,
+        spec_clamp_lo: float,
+        spec_clamp_hi: float,
     ):
         super().__init__()
-        self.src_path = src_path
-        self.out_path = out_path
-        self.hop_length = hop_length
-        self.frame_length = frame_length
-        self.env_alpha = env_alpha
-        self.f0_alpha = f0_alpha
-        self.gate_unvoiced = gate_unvoiced
-        self.output_gain = output_gain
-        self.wavetable_path = wavetable_path
-        self.wt_position = wt_position
-        self.wt_mip_strength = wt_mip_strength
+        self.input_path = input_path
+        self.output_path = output_path
+        self.mode = mode
+        self.wt_dir = wt_dir
+        self.seed = int(seed)
+        self.pos_min = float(pos_min)
+        self.pos_max = float(pos_max)
+        self.mip_min = float(mip_min)
+        self.mip_max = float(mip_max)
+        self.hop_length = int(hop_length)
+        self.frame_length = int(frame_length)
+        self.env_alpha = float(env_alpha)
+        self.f0_alpha = float(f0_alpha)
+        self.gate_unvoiced = bool(gate_unvoiced)
+        self.output_gain = float(output_gain)
 
-    def run(self):
-        try:
-            self.log.emit("Procesando: Pitch map + Envelope → Wavetable Synth")
+        self.enable_spec_match = bool(enable_spec_match)
+        self.spec_strength = float(spec_strength)
+        self.spec_smooth_bins = int(spec_smooth_bins)
+        self.spec_clamp_lo = float(spec_clamp_lo)
+        self.spec_clamp_hi = float(spec_clamp_hi)
 
-            if not self.wavetable_path:
-                raise RuntimeError("Selecciona un WAV para el wavetable.")
+        # cache mipmaps por wavetable para reutilizar en batch
+        self._mipmap_cache = {}
 
-            self.progress.emit(5)
-            self.log.emit("Cargando audio fuente...")
-            y, sr = load_mono(self.src_path)
-            self.log.emit(f"  Fuente: {len(y)} samples, sr={sr}")
+    def _load_mipmaps_cached(self, wt_path: str):
+        wt_path = os.path.abspath(wt_path)
+        mm = self._mipmap_cache.get(wt_path)
+        if mm is not None:
+            return mm
+        frames = load_wavetable_wav(wt_path, frame_size=WT_FRAME_SIZE)
+        mipmaps = build_wavetable_mipmaps(frames, levels=WT_MIP_LEVELS)
+        self._mipmap_cache[wt_path] = mipmaps
+        return mipmaps
 
-            self.progress.emit(15)
-            self.log.emit("Cargando wavetable...")
-            frames = load_wavetable_wav(self.wavetable_path, frame_size=WT_FRAME_SIZE)
-            mipmaps = build_wavetable_mipmaps(frames, levels=WT_MIP_LEVELS)
-            self.log.emit(f"  Wavetable: {frames.shape[0]} frame(s), size={frames.shape[1]}, mips={len(mipmaps)}")
+    def _process_one(self, src_file: str, out_file: str, wavetable_files: list, rng: np.random.Generator):
+        self.log.emit(f"Fuente: {os.path.basename(src_file)}")
+        y, sr = load_mono(src_file)
+        self.log.emit(f"  len={len(y)} sr={sr}")
 
-            self.progress.emit(35)
-            self.log.emit("Extrayendo F0/voicing + envelope (RMS)...")
-            f0_frames, voiced, env_frames = extract_pitch_voicing_and_env(
-                y=y,
-                sr=sr,
-                frame_length=self.frame_length,
-                hop_length=self.hop_length,
-                env_smooth_alpha=self.env_alpha,
-                f0_smooth_alpha=self.f0_alpha,
-                gate_unvoiced=self.gate_unvoiced,
-            )
+        self.log.emit("  Analizando: F0 + multiband env + spectral envelope...")
+        f0_frames, voiced, env_bands, spec_env = extract_f0_multiband_env_and_specenv(
+            y=y,
+            sr=sr,
+            frame_length=self.frame_length,
+            hop_length=self.hop_length,
+            f0_smooth_alpha=self.f0_alpha,
+            env_smooth_alpha=self.env_alpha,
+            gate_unvoiced=self.gate_unvoiced,
+            spec_smooth_bins=self.spec_smooth_bins,
+        )
 
-            midi_frames = lr_hz_to_midi(f0_frames)
-            self.pitch_midi.emit(midi_frames)
+        # 4 capas random
+        if len(wavetable_files) == 0:
+            raise RuntimeError("No hay wavetables .wav en la carpeta seleccionada.")
 
-            self.progress.emit(65)
-            self.log.emit("Sintetizando wavetable...")
-            out = synth_wavetable_from_f0_env(
+        picks = rng.choice(wavetable_files, size=4, replace=(len(wavetable_files) < 4))
+        layers = []
+
+        for i in range(4):
+            wt = str(picks[i])
+            mipmaps = self._load_mipmaps_cached(wt)
+
+            pos = float(rng.uniform(self.pos_min, self.pos_max))
+            mip = float(rng.uniform(self.mip_min, self.mip_max))
+
+            layer = synth_wavetable_from_f0_env(
                 f0_frames_hz=f0_frames,
-                env_frames=env_frames,
+                env_frames=env_bands[i],
                 sr=sr,
                 n_samples=len(y),
                 frame_length=self.frame_length,
                 hop_length=self.hop_length,
                 mipmaps=mipmaps,
-                position=self.wt_position,
-                mip_strength=self.wt_mip_strength,
+                position=pos,
+                mip_strength=mip,
+            )
+            layers.append(layer)
+
+            self.log.emit(f"  Layer {i+1}: {os.path.basename(wt)} | pos={pos:.2f} mip={mip:.2f}")
+
+        mix = np.sum(np.stack(layers, axis=0), axis=0).astype(np.float32)
+
+        # normalizar mezcla
+        mx = float(np.max(np.abs(mix)) + 1e-12)
+        mix = (mix / mx * 0.95).astype(np.float32)
+
+        # spectral match
+        if self.enable_spec_match:
+            self.log.emit("  Aplicando spectral envelope match (timbre)...")
+            mix = spectral_envelope_match(
+                y_syn=mix,
+                sr=sr,
+                spec_env_src=spec_env,
+                frame_length=self.frame_length,
+                hop_length=self.hop_length,
+                spec_smooth_bins=self.spec_smooth_bins,
+                strength=self.spec_strength,
+                clamp_lo=self.spec_clamp_lo,
+                clamp_hi=self.spec_clamp_hi,
             )
 
-            self.progress.emit(80)
-            if self.output_gain != 1.0:
-                out = np.clip(out * float(self.output_gain), -1.0, 1.0)
+        # gain final
+        if self.output_gain != 1.0:
+            mix = np.clip(mix * float(self.output_gain), -1.0, 1.0).astype(np.float32)
 
-            self.log.emit(f"Guardando WAV: {self.out_path}")
-            self.progress.emit(95)
-            sf.write(self.out_path, out, sr)
+        sf.write(out_file, mix, sr)
+        self.log.emit(f"  Guardado: {out_file}")
+
+    def run(self):
+        try:
+            if not self.input_path:
+                raise RuntimeError("Selecciona un input.")
+            if not self.output_path:
+                raise RuntimeError("Selecciona un output.")
+            wavetable_files = list_wav_files(self.wt_dir)
+            if len(wavetable_files) == 0:
+                raise RuntimeError("No se encontraron .wav en la carpeta de wavetables.")
+
+            if self.mode == "single":
+                src_file = self.input_path
+                out_file = self.output_path
+
+                seed = self.seed if self.seed != 0 else stable_seed_from_path(src_file)
+                rng = np.random.default_rng(seed)
+
+                self.progress.emit(5)
+                self.log.emit("=== PROCESO SINGLE ===")
+                self.log.emit(f"Wavetable dir: {self.wt_dir} | count={len(wavetable_files)} | seed={seed}")
+                self._process_one(src_file, out_file, wavetable_files, rng)
+                self.progress.emit(100)
+                self.finished.emit()
+                return
+
+            # batch
+            in_dir = self.input_path
+            out_dir = self.output_path
+            if not os.path.isdir(in_dir):
+                raise RuntimeError("En modo batch, el input debe ser una carpeta.")
+            if not os.path.isdir(out_dir):
+                os.makedirs(out_dir, exist_ok=True)
+
+            files = []
+            for ext in AUDIO_EXTS:
+                files.extend(glob.glob(os.path.join(in_dir, f"*{ext}")))
+                files.extend(glob.glob(os.path.join(in_dir, f"*{ext.upper()}")))
+            files.sort(key=lambda p: p.lower())
+
+            if not files:
+                raise RuntimeError("No se encontraron audios en la carpeta input.")
+
+            self.log.emit("=== PROCESO BATCH ===")
+            self.log.emit(f"Input: {in_dir}")
+            self.log.emit(f"Output: {out_dir}")
+            self.log.emit(f"Wavetable dir: {self.wt_dir} | count={len(wavetable_files)}")
+            self.progress.emit(1)
+
+            total = len(files)
+            for idx, src_file in enumerate(files):
+                base = os.path.splitext(os.path.basename(src_file))[0]
+                out_file = os.path.join(out_dir, base + "__restored.wav")
+
+                seed = self.seed if self.seed != 0 else stable_seed_from_path(src_file)
+                rng = np.random.default_rng(seed)
+
+                p = int(5 + 90 * (idx / max(1, total)))
+                self.progress.emit(p)
+                self.log.emit(f"\n[{idx+1}/{total}] seed={seed}")
+                self._process_one(src_file, out_file, wavetable_files, rng)
 
             self.progress.emit(100)
-            self.log.emit("Listo.")
             self.finished.emit()
 
         except Exception as e:
@@ -482,99 +651,108 @@ class AudioWorker(QObject):
 class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("Pitch+Envelope Wavetable Synth (sin sklearn)")
-        self.resize(1180, 740)
-
-        # player preview
-        self._audio_output = QAudioOutput()
-        self._player = QMediaPlayer()
-        self._player.setAudioOutput(self._audio_output)
-        self._preview_tmp_path = None
-
-        # wavetable cache
-        self._wt_cache_path = None
-        self._wt_cache_mipmaps = None
+        self.setWindowTitle("Restaurador por Síntesis (4 bandas + timbre match)")
+        self.resize(980, 680)
 
         central = QWidget()
         self.setCentralWidget(central)
-        outer = QVBoxLayout(central)
-        outer.setContentsMargins(10, 10, 10, 10)
 
-        splitter = QSplitter(Qt.Horizontal)
-        outer.addWidget(splitter)
+        layout = QVBoxLayout(central)
+        layout.setContentsMargins(15, 15, 15, 15)
+        layout.setSpacing(10)
 
-        # ---------- LEFT: Browser ----------
-        left = QWidget()
-        left_layout = QVBoxLayout(left)
-        left_layout.setContentsMargins(10, 10, 10, 10)
-        left_layout.setSpacing(8)
+        # Mode
+        row_mode = QHBoxLayout()
+        row_mode.addWidget(QLabel("Modo:"))
+        self.mode_combo = QComboBox()
+        self.mode_combo.addItems(["single", "batch"])
+        row_mode.addWidget(self.mode_combo)
+        row_mode.addStretch()
+        layout.addLayout(row_mode)
 
-        gb = QGroupBox("Wavetable Browser")
-        gb_l = QVBoxLayout(gb)
-
-        self.wt_dir_edit = QLineEdit(WT_DIR_DEFAULT)
-        self.wt_dir_edit.setPlaceholderText(r"Carpeta de wavetables (ej: D:\WAVETABLE)")
-        btn_choose_dir = QPushButton("Cambiar carpeta…")
-        btn_refresh = QPushButton("Refrescar")
-        dir_row = QHBoxLayout()
-        dir_row.addWidget(self.wt_dir_edit, stretch=1)
-        dir_row.addWidget(btn_choose_dir)
-        dir_row.addWidget(btn_refresh)
-        gb_l.addLayout(dir_row)
-
-        self.wt_filter = QLineEdit()
-        self.wt_filter.setPlaceholderText("Filtrar (texto)…")
-        gb_l.addWidget(self.wt_filter)
-
-        self.wt_list = QListWidget()
-        gb_l.addWidget(self.wt_list, stretch=1)
-
-        btn_preview = QPushButton("Preview (P)")
-        gb_l.addWidget(btn_preview)
-
-        left_layout.addWidget(gb, stretch=1)
-        splitter.addWidget(left)
-
-        # ---------- RIGHT: Main panel ----------
-        right = QWidget()
-        r = QVBoxLayout(right)
-        r.setContentsMargins(10, 10, 10, 10)
-        r.setSpacing(10)
-
-        # Paths
-        self.src_edit = QLineEdit()
+        # Input/Output
+        self.in_edit = QLineEdit()
         self.out_edit = QLineEdit()
-        self.wt_edit = QLineEdit()
 
-        btn_src = QPushButton("Examinar…")
-        btn_out = QPushButton("Guardar como…")
-        btn_wt = QPushButton("Wavetable…")
+        btn_in = QPushButton("Elegir…")
+        btn_out = QPushButton("Elegir…")
+        btn_in.clicked.connect(self.browse_input)
+        btn_out.clicked.connect(self.browse_output)
 
-        btn_src.clicked.connect(self.browse_src)
-        btn_out.clicked.connect(self.browse_out)
-        btn_wt.clicked.connect(self.browse_wt)
-
-        row_src = QHBoxLayout()
-        row_src.addWidget(QLabel("Audio fuente:"))
-        row_src.addWidget(self.src_edit)
-        row_src.addWidget(btn_src)
-
-        row_wt = QHBoxLayout()
-        row_wt.addWidget(QLabel("Wavetable WAV:"))
-        row_wt.addWidget(self.wt_edit)
-        row_wt.addWidget(btn_wt)
+        row_in = QHBoxLayout()
+        row_in.addWidget(QLabel("Input (archivo o carpeta):"))
+        row_in.addWidget(self.in_edit)
+        row_in.addWidget(btn_in)
 
         row_out = QHBoxLayout()
-        row_out.addWidget(QLabel("Salida WAV:"))
+        row_out.addWidget(QLabel("Output (archivo o carpeta):"))
         row_out.addWidget(self.out_edit)
         row_out.addWidget(btn_out)
 
-        r.addLayout(row_src)
-        r.addLayout(row_wt)
-        r.addLayout(row_out)
+        layout.addLayout(row_in)
+        layout.addLayout(row_out)
 
-        # Controls
-        controls = QHBoxLayout()
+        # Wavetable settings
+        gb_wt = QGroupBox("Wavetables (random desde carpeta)")
+        g = QVBoxLayout(gb_wt)
+
+        self.wt_dir_edit = QLineEdit(WT_DIR_DEFAULT)
+        btn_wt_dir = QPushButton("Carpeta…")
+        btn_wt_dir.clicked.connect(self.browse_wt_dir)
+
+        row_wtdir = QHBoxLayout()
+        row_wtdir.addWidget(QLabel("Carpeta wavetables:"))
+        row_wtdir.addWidget(self.wt_dir_edit)
+        row_wtdir.addWidget(btn_wt_dir)
+        g.addLayout(row_wtdir)
+
+        row_rand = QHBoxLayout()
+        self.seed_spin = QSpinBox()
+        self.seed_spin.setRange(0, 2_000_000_000)
+        self.seed_spin.setValue(0)
+        row_rand.addWidget(QLabel("Seed (0=auto por archivo):"))
+        row_rand.addWidget(self.seed_spin)
+
+        self.pos_min = QDoubleSpinBox()
+        self.pos_min.setRange(0.0, 1.0)
+        self.pos_min.setSingleStep(0.01)
+        self.pos_min.setValue(0.0)
+
+        self.pos_max = QDoubleSpinBox()
+        self.pos_max.setRange(0.0, 1.0)
+        self.pos_max.setSingleStep(0.01)
+        self.pos_max.setValue(1.0)
+
+        self.mip_min = QDoubleSpinBox()
+        self.mip_min.setRange(0.0, 1.0)
+        self.mip_min.setSingleStep(0.05)
+        self.mip_min.setValue(0.6)
+
+        self.mip_max = QDoubleSpinBox()
+        self.mip_max.setRange(0.0, 1.0)
+        self.mip_max.setSingleStep(0.05)
+        self.mip_max.setValue(1.0)
+
+        row_rand.addSpacing(10)
+        row_rand.addWidget(QLabel("WT pos min:"))
+        row_rand.addWidget(self.pos_min)
+        row_rand.addWidget(QLabel("max:"))
+        row_rand.addWidget(self.pos_max)
+
+        row_rand.addSpacing(10)
+        row_rand.addWidget(QLabel("WT mip min:"))
+        row_rand.addWidget(self.mip_min)
+        row_rand.addWidget(QLabel("max:"))
+        row_rand.addWidget(self.mip_max)
+
+        row_rand.addStretch()
+        g.addLayout(row_rand)
+
+        layout.addWidget(gb_wt)
+
+        # Analysis settings
+        gb_an = QGroupBox("Análisis")
+        a = QHBoxLayout(gb_an)
 
         self.hop_spin = QSpinBox()
         self.hop_spin.setRange(64, 4096)
@@ -599,296 +777,179 @@ class MainWindow(QMainWindow):
         self.gain_spin.setSingleStep(0.1)
         self.gain_spin.setValue(1.0)
 
-        self.wt_pos = QDoubleSpinBox()
-        self.wt_pos.setRange(0.0, 1.0)
-        self.wt_pos.setSingleStep(0.01)
-        self.wt_pos.setValue(0.0)
+        a.addWidget(QLabel("Hop:"))
+        a.addWidget(self.hop_spin)
+        a.addSpacing(10)
+        a.addWidget(QLabel("Env α:"))
+        a.addWidget(self.env_alpha)
+        a.addSpacing(10)
+        a.addWidget(QLabel("F0 α:"))
+        a.addWidget(self.f0_alpha)
+        a.addSpacing(12)
+        a.addWidget(self.gate_check)
+        a.addSpacing(10)
+        a.addWidget(QLabel("Gain:"))
+        a.addWidget(self.gain_spin)
+        a.addStretch()
 
-        self.wt_mip = QDoubleSpinBox()
-        self.wt_mip.setRange(0.0, 1.0)
-        self.wt_mip.setSingleStep(0.05)
-        self.wt_mip.setValue(1.0)
+        layout.addWidget(gb_an)
 
-        controls.addWidget(QLabel("Hop:"))
-        controls.addWidget(self.hop_spin)
-        controls.addSpacing(10)
+        # Spectral match
+        gb_sm = QGroupBox("Spectral envelope match (timbre / EQ dinámica)")
+        s = QHBoxLayout(gb_sm)
 
-        controls.addWidget(QLabel("Env α:"))
-        controls.addWidget(self.env_alpha)
-        controls.addSpacing(10)
+        self.spec_enable = QCheckBox("Activar")
+        self.spec_enable.setChecked(True)
 
-        controls.addWidget(QLabel("F0 α:"))
-        controls.addWidget(self.f0_alpha)
-        controls.addSpacing(10)
+        self.spec_strength = QDoubleSpinBox()
+        self.spec_strength.setRange(0.0, 1.0)
+        self.spec_strength.setSingleStep(0.05)
+        self.spec_strength.setValue(0.7)
 
-        controls.addWidget(self.gate_check)
-        controls.addSpacing(10)
+        self.spec_smooth_bins = QSpinBox()
+        self.spec_smooth_bins.setRange(1, 256)
+        self.spec_smooth_bins.setValue(25)
 
-        controls.addWidget(QLabel("Gain:"))
-        controls.addWidget(self.gain_spin)
-        controls.addSpacing(18)
+        self.spec_clamp_lo = QDoubleSpinBox()
+        self.spec_clamp_lo.setRange(0.01, 1.0)
+        self.spec_clamp_lo.setSingleStep(0.05)
+        self.spec_clamp_lo.setValue(0.25)
 
-        controls.addWidget(QLabel("WT Position:"))
-        controls.addWidget(self.wt_pos)
-        controls.addSpacing(10)
+        self.spec_clamp_hi = QDoubleSpinBox()
+        self.spec_clamp_hi.setRange(1.0, 20.0)
+        self.spec_clamp_hi.setSingleStep(0.5)
+        self.spec_clamp_hi.setValue(4.0)
 
-        controls.addWidget(QLabel("WT Mip:"))
-        controls.addWidget(self.wt_mip)
+        s.addWidget(self.spec_enable)
+        s.addSpacing(10)
+        s.addWidget(QLabel("Strength:"))
+        s.addWidget(self.spec_strength)
+        s.addSpacing(10)
+        s.addWidget(QLabel("Smooth bins:"))
+        s.addWidget(self.spec_smooth_bins)
+        s.addSpacing(10)
+        s.addWidget(QLabel("Clamp lo:"))
+        s.addWidget(self.spec_clamp_lo)
+        s.addWidget(QLabel("hi:"))
+        s.addWidget(self.spec_clamp_hi)
+        s.addStretch()
 
-        controls.addStretch()
-        r.addLayout(controls)
+        layout.addWidget(gb_sm)
 
-        # Process button
-        self.btn_process = QPushButton("Procesar (wavetable)")
+        # Process
+        self.btn_process = QPushButton("Procesar")
         self.btn_process.clicked.connect(self.start_processing)
-        r.addWidget(self.btn_process)
+        layout.addWidget(self.btn_process)
 
-        # Progress + Plot + Logs
         self.progress = QProgressBar()
         self.progress.setRange(0, 100)
         self.progress.setValue(0)
-        r.addWidget(self.progress)
-
-        self.pitch_canvas = PitchPlotCanvas(self)
-        r.addWidget(self.pitch_canvas)
+        layout.addWidget(self.progress)
 
         self.logs = QTextEdit()
         self.logs.setReadOnly(True)
-        r.addWidget(self.logs, stretch=1)
+        layout.addWidget(self.logs, stretch=1)
 
-        r.addItem(QSpacerItem(0, 10, QSizePolicy.Minimum, QSizePolicy.Expanding))
+        layout.addItem(QSpacerItem(0, 10, QSizePolicy.Minimum, QSizePolicy.Expanding))
         footer = QLabel("© 2025 Gabriel Golker")
         footer.setAlignment(Qt.AlignCenter)
-        r.addWidget(footer)
+        layout.addWidget(footer)
 
-        splitter.addWidget(right)
-        splitter.setStretchFactor(0, 1)
-        splitter.setStretchFactor(1, 3)
+        self.thread = None
+        self.worker = None
 
-        # Signals browser
-        btn_choose_dir.clicked.connect(self.choose_wt_dir)
-        btn_refresh.clicked.connect(self.refresh_wavetables)
-        self.wt_filter.textChanged.connect(self.refresh_wavetables)
-        self.wt_list.itemSelectionChanged.connect(self.on_wt_selected)
-        self.wt_list.itemDoubleClicked.connect(lambda _item: self.preview_selected_wavetable())
-        btn_preview.clicked.connect(self.preview_selected_wavetable)
-
-        # Shortcut P
-        self._shortcut_preview = QShortcut(QKeySequence("P"), self)
-        self._shortcut_preview.activated.connect(self.preview_selected_wavetable)
-
-        # initial fill
-        self.refresh_wavetables()
-
-    # ---------- helpers ----------
     def log(self, msg: str):
         self.logs.append(msg)
 
-    def _safe_list_wavs(self, folder: str):
-        try:
-            names = []
-            for entry in os.listdir(folder):
-                if entry.lower().endswith(".wav"):
-                    names.append(entry)
-            names.sort(key=lambda s: s.lower())
-            return names
-        except Exception:
-            return []
+    def browse_input(self):
+        mode = self.mode_combo.currentText()
+        if mode == "single":
+            path, _ = QFileDialog.getOpenFileName(
+                self, "Seleccionar audio fuente", "", "Audio files (*.wav *.flac *.ogg *.mp3 *.aiff *.m4a);;Todos (*.*)"
+            )
+            if path:
+                self.in_edit.setText(path)
+        else:
+            folder = QFileDialog.getExistingDirectory(self, "Seleccionar carpeta input")
+            if folder:
+                self.in_edit.setText(folder)
 
-    def _load_mipmaps_cached(self, wavetable_path: str):
-        wavetable_path = os.path.abspath(wavetable_path)
-        if self._wt_cache_path == wavetable_path and self._wt_cache_mipmaps is not None:
-            return self._wt_cache_mipmaps
+    def browse_output(self):
+        mode = self.mode_combo.currentText()
+        if mode == "single":
+            path, _ = QFileDialog.getSaveFileName(
+                self, "Guardar salida", "resultado__restored.wav", "WAV (*.wav);;Todos (*.*)"
+            )
+            if path:
+                self.out_edit.setText(path)
+        else:
+            folder = QFileDialog.getExistingDirectory(self, "Seleccionar carpeta output")
+            if folder:
+                self.out_edit.setText(folder)
 
-        frames = load_wavetable_wav(wavetable_path, frame_size=WT_FRAME_SIZE)
-        mipmaps = build_wavetable_mipmaps(frames, levels=WT_MIP_LEVELS)
-        self._wt_cache_path = wavetable_path
-        self._wt_cache_mipmaps = mipmaps
-        return mipmaps
-
-    # ---------- Browser ----------
-    def choose_wt_dir(self):
+    def browse_wt_dir(self):
         start = self.wt_dir_edit.text().strip() or WT_DIR_DEFAULT
         folder = QFileDialog.getExistingDirectory(self, "Seleccionar carpeta de wavetables", start)
         if folder:
             self.wt_dir_edit.setText(folder)
-            self.refresh_wavetables()
 
-    def refresh_wavetables(self):
-        folder = self.wt_dir_edit.text().strip()
-        flt = self.wt_filter.text().strip().lower()
-
-        self.wt_list.clear()
-
-        if not folder or not os.path.isdir(folder):
-            self.wt_list.addItem(QListWidgetItem("(Carpeta no encontrada)"))
-            return
-
-        files = self._safe_list_wavs(folder)
-        if flt:
-            files = [f for f in files if flt in f.lower()]
-
-        if not files:
-            self.wt_list.addItem(QListWidgetItem("(No hay WAVs / filtro sin resultados)"))
-            return
-
-        for f in files:
-            self.wt_list.addItem(QListWidgetItem(f))
-
-    def on_wt_selected(self):
-        folder = self.wt_dir_edit.text().strip()
-        items = self.wt_list.selectedItems()
-        if not items or not folder or not os.path.isdir(folder):
-            return
-
-        name = items[0].text()
-        if name.startswith("("):
-            return
-
-        full = os.path.join(folder, name)
-        self.wt_edit.setText(full)
-
-        # Invalida cache si cambia
-        if self._wt_cache_path != os.path.abspath(full):
-            self._wt_cache_path = None
-            self._wt_cache_mipmaps = None
-
-    # ---------- Preview (P) ----------
-    def preview_selected_wavetable(self):
-        wt_path = self.wt_edit.text().strip()
-        if not wt_path or not os.path.isfile(wt_path):
-            QMessageBox.warning(self, "Preview", "Selecciona un wavetable WAV válido.")
-            return
-
-        try:
-            mipmaps = self._load_mipmaps_cached(wt_path)
-
-            # preview: 2.0s a 44.1k, nota A3 (220Hz)
-            sr = 44100
-            dur = 2.0
-            n = int(sr * dur)
-
-            f0 = np.full(n, 220.0, dtype=np.float32)
-
-            pos = float(self.wt_pos.value())
-            mip = float(self.wt_mip.value())
-
-            osc, _ = render_wavetable_osc(
-                f0_hz=f0,
-                sr=sr,
-                mipmaps=mipmaps,
-                position=pos,
-                phase0=0.0,
-                mip_strength=mip,
-            )
-
-            # envelope simple para evitar clicks
-            env = np.ones(n, dtype=np.float32)
-            fade = int(0.02 * sr)  # 20ms
-            if fade > 0 and 2 * fade < n:
-                ramp = np.linspace(0.0, 1.0, fade, dtype=np.float32)
-                env[:fade] = ramp
-                env[-fade:] = ramp[::-1]
-
-            out = np.clip(osc * env * 0.35, -1.0, 1.0).astype(np.float32)
-
-            # escribir a temp y reproducir con QMediaPlayer
-            fd, tmp_path = tempfile.mkstemp(prefix="wt_preview_", suffix=".wav")
-            os.close(fd)
-            sf.write(tmp_path, out, sr)
-
-            # limpiar anterior
-            if self._preview_tmp_path and os.path.isfile(self._preview_tmp_path):
-                try:
-                    os.remove(self._preview_tmp_path)
-                except Exception:
-                    pass
-            self._preview_tmp_path = tmp_path
-
-            self._player.stop()
-            self._player.setSource(QUrl.fromLocalFile(tmp_path))
-            self._audio_output.setVolume(1.0)
-            self._player.play()
-
-            self.log(f"Preview (P): {os.path.basename(wt_path)} | pos={pos:.2f} mip={mip:.2f}")
-
-        except Exception as e:
-            QMessageBox.critical(self, "Preview error", str(e))
-            self.log(f"ERROR preview: {e}")
-
-    # ---------- File dialogs ----------
-    def browse_src(self):
-        path, _ = QFileDialog.getOpenFileName(
-            self, "Seleccionar audio fuente", "", "Audio files (*.wav *.flac *.ogg *.mp3);;Todos (*.*)"
-        )
-        if path:
-            self.src_edit.setText(path)
-
-    def browse_wt(self):
-        start = self.wt_dir_edit.text().strip() or WT_DIR_DEFAULT
-        path, _ = QFileDialog.getOpenFileName(
-            self, "Seleccionar wavetable WAV", start, "WAV (*.wav);;Todos (*.*)"
-        )
-        if path:
-            self.wt_edit.setText(path)
-            # invalidar cache
-            self._wt_cache_path = None
-            self._wt_cache_mipmaps = None
-
-    def browse_out(self):
-        path, _ = QFileDialog.getSaveFileName(
-            self, "Guardar salida", "resultado.wav", "WAV (*.wav);;Todos (*.*)"
-        )
-        if path:
-            self.out_edit.setText(path)
-
-    # ---------- Processing ----------
     def start_processing(self):
-        src = self.src_edit.text().strip()
+        mode = self.mode_combo.currentText()
+        inp = self.in_edit.text().strip()
         outp = self.out_edit.text().strip()
-        wt = self.wt_edit.text().strip()
 
-        if not src or not outp:
-            QMessageBox.warning(self, "Falta info", "Selecciona audio fuente y ruta de salida.")
-            return
-        if not wt:
-            QMessageBox.warning(self, "Falta wavetable", "Selecciona un wavetable WAV.")
+        if not inp or not outp:
+            QMessageBox.warning(self, "Falta info", "Completa input y output.")
             return
 
-        hop = int(self.hop_spin.value())
-        frame_length = DEFAULT_FRAME_LENGTH
-        env_a = float(self.env_alpha.value())
-        f0_a = float(self.f0_alpha.value())
-        gate = bool(self.gate_check.isChecked())
-        gain = float(self.gain_spin.value())
-        wt_pos = float(self.wt_pos.value())
-        wt_mip = float(self.wt_mip.value())
+        wt_dir = self.wt_dir_edit.text().strip()
+        if not wt_dir or not os.path.isdir(wt_dir):
+            QMessageBox.warning(self, "Wavetables", "La carpeta de wavetables no existe.")
+            return
+
+        # validate ranges
+        pos_min = float(self.pos_min.value())
+        pos_max = float(self.pos_max.value())
+        if pos_min > pos_max:
+            pos_min, pos_max = pos_max, pos_min
+
+        mip_min = float(self.mip_min.value())
+        mip_max = float(self.mip_max.value())
+        if mip_min > mip_max:
+            mip_min, mip_max = mip_max, mip_min
 
         self.logs.clear()
-        self.pitch_canvas.clear_plot()
         self.progress.setValue(0)
         self.btn_process.setEnabled(False)
 
         self.thread = QThread()
         self.worker = AudioWorker(
-            src_path=src,
-            out_path=outp,
-            hop_length=hop,
-            frame_length=frame_length,
-            env_alpha=env_a,
-            f0_alpha=f0_a,
-            gate_unvoiced=gate,
-            output_gain=gain,
-            wavetable_path=wt,
-            wt_position=wt_pos,
-            wt_mip_strength=wt_mip,
+            input_path=inp,
+            output_path=outp,
+            mode=mode,
+            wt_dir=wt_dir,
+            seed=int(self.seed_spin.value()),
+            pos_min=pos_min,
+            pos_max=pos_max,
+            mip_min=mip_min,
+            mip_max=mip_max,
+            hop_length=int(self.hop_spin.value()),
+            frame_length=DEFAULT_FRAME_LENGTH,
+            env_alpha=float(self.env_alpha.value()),
+            f0_alpha=float(self.f0_alpha.value()),
+            gate_unvoiced=bool(self.gate_check.isChecked()),
+            output_gain=float(self.gain_spin.value()),
+            enable_spec_match=bool(self.spec_enable.isChecked()),
+            spec_strength=float(self.spec_strength.value()),
+            spec_smooth_bins=int(self.spec_smooth_bins.value()),
+            spec_clamp_lo=float(self.spec_clamp_lo.value()),
+            spec_clamp_hi=float(self.spec_clamp_hi.value()),
         )
         self.worker.moveToThread(self.thread)
 
         self.thread.started.connect(self.worker.run)
         self.worker.progress.connect(self.progress.setValue)
         self.worker.log.connect(self.log)
-        self.worker.pitch_midi.connect(lambda arr: self.pitch_canvas.plot_midi(np.array(arr)))
         self.worker.finished.connect(self.on_done)
         self.worker.error.connect(self.on_err)
 
@@ -903,7 +964,7 @@ class MainWindow(QMainWindow):
 
     def on_done(self):
         self.btn_process.setEnabled(True)
-        QMessageBox.information(self, "Listo", "Audio sintetizado correctamente.")
+        QMessageBox.information(self, "Listo", "Proceso completado.")
 
     def on_err(self, msg: str):
         self.btn_process.setEnabled(True)
