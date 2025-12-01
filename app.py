@@ -32,7 +32,6 @@ from PySide6.QtWidgets import (
     QGroupBox,
 )
 
-
 # ----------------- DEFAULTS -----------------
 
 FMIN_NOTE = "C2"
@@ -47,6 +46,8 @@ WT_MIP_LEVELS = 8
 WT_DIR_DEFAULT = r"D:\WAVETABLE"
 
 AUDIO_EXTS = (".wav", ".flac", ".ogg", ".mp3", ".aiff", ".aif", ".m4a")
+
+DEFAULT_GROOVE_AMOUNT = 0.8  # 0 = sin groove match, 1 = groove muy marcado
 
 
 # ----------------- WAVETABLE OSC -----------------
@@ -265,6 +266,75 @@ def smooth_freq_logmag(logmag: np.ndarray, smooth_bins: int) -> np.ndarray:
     return out
 
 
+def compute_groove_env_from_env_bands(
+    env_bands: np.ndarray,
+    onset_sensitivity: float = 1.5,
+    min_interval_frames: int = 4,
+    decay_frames: int = 8,
+) -> np.ndarray:
+    """
+    env_bands: (4, n_frames)
+    Devuelve groove_env: (n_frames,) con acentos donde hay golpes (onsets).
+    """
+    env_bands = np.asarray(env_bands, dtype=np.float32)
+    if env_bands.ndim != 2 or env_bands.shape[0] < 1:
+        return np.ones((env_bands.shape[-1],), dtype=np.float32) if env_bands.ndim == 2 else np.ones((1,), dtype=np.float32)
+
+    # 1) Envolvente "global": promedio de bandas (ya normalizadas)
+    env_global = np.mean(env_bands, axis=0).astype(np.float32)
+    n = len(env_global)
+    if n < 3:
+        return np.ones(n, dtype=np.float32)
+
+    # 2) Delta positivo (onset strength aproximado)
+    diff = env_global[1:] - env_global[:-1]
+    onset_strength = np.maximum(diff, 0.0)
+    onset_strength = np.concatenate([[0.0], onset_strength])  # alineamos
+
+    # 3) Normalizamos
+    mx = float(np.max(onset_strength) + 1e-12)
+    onset_strength = onset_strength / mx
+
+    # 4) Umbral relativo
+    thr = float(np.mean(onset_strength) + onset_sensitivity * np.std(onset_strength))
+
+    # 5) Peak picking simple con distancia mínima
+    peaks = []
+    last_peak = -int(min_interval_frames)
+    for i in range(1, n - 1):
+        if i - last_peak < min_interval_frames:
+            continue
+        if (
+            onset_strength[i] > thr
+            and onset_strength[i] >= onset_strength[i - 1]
+            and onset_strength[i] >= onset_strength[i + 1]
+        ):
+            peaks.append(i)
+            last_peak = i
+
+    groove_env = np.zeros(n, dtype=np.float32)
+
+    # 6) ataque + decay (solo decay hacia adelante, práctico y estable)
+    decay_frames = int(max(1, decay_frames))
+    for p in peaks:
+        groove_env[p] = 1.0
+        for k in range(1, decay_frames):
+            j = p + k
+            if j >= n:
+                break
+            val = float(np.exp(-k / float(decay_frames)))
+            if val > groove_env[j]:
+                groove_env[j] = val
+
+    # fallback si no encontró picos
+    if len(peaks) == 0:
+        groove_env[:] = env_global
+        mx2 = float(np.max(groove_env) + 1e-12)
+        groove_env /= mx2
+
+    return groove_env.astype(np.float32, copy=False)
+
+
 def extract_f0_multiband_env_and_specenv(
     y: np.ndarray,
     sr: int,
@@ -302,16 +372,22 @@ def extract_f0_multiband_env_and_specenv(
 
     # ---- STFT magnitude ----
     n_fft = frame_length
-    S = lr_stft(y.astype(np.float32), n_fft=n_fft, hop_length=hop_length, win_length=frame_length, center=True)
+    S = lr_stft(
+        y.astype(np.float32),
+        n_fft=n_fft,
+        hop_length=hop_length,
+        win_length=frame_length,
+        center=True,
+    )
     mag = np.abs(S).astype(np.float32)
     n_bins, n_frames = mag.shape
 
     # ---- multiband env (4 bandas) ----
     freqs = np.linspace(0.0, sr / 2.0, n_bins, dtype=np.float32)
     edges = [
-        (20.0, 140.0),     # low
-        (140.0, 700.0),    # lowmid
-        (700.0, 4000.0),   # highmid
+        (20.0, 140.0),  # low
+        (140.0, 700.0),  # lowmid
+        (700.0, 4000.0),  # highmid
         (4000.0, min(16000.0, sr / 2.0 - 1.0)),  # high
     ]
 
@@ -350,7 +426,7 @@ def extract_f0_multiband_env_and_specenv(
 def spectral_envelope_match(
     y_syn: np.ndarray,
     sr: int,
-    spec_env_src: np.ndarray,   # (bins, frames)
+    spec_env_src: np.ndarray,  # (bins, frames)
     frame_length: int,
     hop_length: int,
     spec_smooth_bins: int,
@@ -363,7 +439,13 @@ def spectral_envelope_match(
         return y_syn
 
     n_fft = frame_length
-    S = lr_stft(y_syn.astype(np.float32), n_fft=n_fft, hop_length=hop_length, win_length=frame_length, center=True)
+    S = lr_stft(
+        y_syn.astype(np.float32),
+        n_fft=n_fft,
+        hop_length=hop_length,
+        win_length=frame_length,
+        center=True,
+    )
     mag = np.abs(S).astype(np.float32)
     phase = np.angle(S).astype(np.float32)
 
@@ -385,7 +467,13 @@ def spectral_envelope_match(
     mag_out = mag_use * np.power(G, strength).astype(np.float32)
 
     S_out = mag_out * (np.cos(ph_use) + 1j * np.sin(ph_use))
-    y_out = lr_istft(S_out, hop_length=hop_length, win_length=frame_length, center=True, length=len(y_syn))
+    y_out = lr_istft(
+        S_out,
+        hop_length=hop_length,
+        win_length=frame_length,
+        center=True,
+        length=len(y_syn),
+    )
     y_out = np.asarray(y_out, dtype=np.float32)
     return np.clip(y_out, -1.0, 1.0).astype(np.float32, copy=False)
 
@@ -426,7 +514,7 @@ class AudioWorker(QObject):
         input_path: str,
         output_path: str,
         wt_dir: str,
-        seed: int,               # 0 => azar total
+        seed: int,  # 0 => azar total
         pos_min: float,
         pos_max: float,
         mip_min: float,
@@ -442,6 +530,7 @@ class AudioWorker(QObject):
         spec_smooth_bins: int,
         spec_clamp_lo: float,
         spec_clamp_hi: float,
+        groove_amount: float,  # NUEVO
     ):
         super().__init__()
         self.input_path = input_path
@@ -464,6 +553,8 @@ class AudioWorker(QObject):
         self.spec_smooth_bins = int(spec_smooth_bins)
         self.spec_clamp_lo = float(spec_clamp_lo)
         self.spec_clamp_hi = float(spec_clamp_hi)
+
+        self.groove_amount = float(np.clip(groove_amount, 0.0, 1.0))  # NUEVO
 
         self._mipmap_cache = {}
 
@@ -494,6 +585,20 @@ class AudioWorker(QObject):
             spec_smooth_bins=self.spec_smooth_bins,
         )
 
+        # ---- GROOVE MATCH (onsets) ----
+        groove_amt = float(np.clip(self.groove_amount, 0.0, 1.0))
+        if groove_amt > 0.0:
+            groove_env = compute_groove_env_from_env_bands(
+                env_bands,
+                onset_sensitivity=1.5,
+                min_interval_frames=4,
+                decay_frames=8,
+            )
+            self.log.emit(f"  Groove match: ON | amount={groove_amt:.2f}")
+        else:
+            groove_env = None
+            self.log.emit("  Groove match: OFF")
+
         picks = rng.choice(wavetable_files, size=4, replace=(len(wavetable_files) < 4))
         layers = []
 
@@ -504,9 +609,16 @@ class AudioWorker(QObject):
             pos = float(rng.uniform(self.pos_min, self.pos_max))
             mip = float(rng.uniform(self.mip_min, self.mip_max))
 
+            env_band = env_bands[i]
+            if groove_env is not None:
+                # env_final = env_band * (1 - groove_amount + groove_amount * groove_env)
+                env_frames = env_band * ((1.0 - groove_amt) + groove_amt * groove_env)
+            else:
+                env_frames = env_band
+
             layer = synth_wavetable_from_f0_env(
                 f0_frames_hz=f0_frames,
-                env_frames=env_bands[i],
+                env_frames=env_frames,
                 sr=sr,
                 n_samples=len(y),
                 frame_length=self.frame_length,
@@ -580,7 +692,9 @@ class AudioWorker(QObject):
 
                 self.progress.emit(5)
                 self.log.emit("=== PROCESO SINGLE ===")
-                self.log.emit(f"Wavetable dir: {self.wt_dir} | count={len(wavetable_files)} | seed={'RANDOM' if self.seed==0 else self.seed}")
+                self.log.emit(
+                    f"Wavetable dir: {self.wt_dir} | count={len(wavetable_files)} | seed={'RANDOM' if self.seed==0 else self.seed}"
+                )
                 self._process_one(inp, out_file, wavetable_files, rng)
                 self.progress.emit(100)
                 self.finished.emit()
@@ -603,7 +717,9 @@ class AudioWorker(QObject):
             self.log.emit("=== PROCESO BATCH ===")
             self.log.emit(f"Input: {in_dir}")
             self.log.emit(f"Output: {out_dir}")
-            self.log.emit(f"Wavetable dir: {self.wt_dir} | count={len(wavetable_files)} | seed={'RANDOM' if self.seed==0 else self.seed}")
+            self.log.emit(
+                f"Wavetable dir: {self.wt_dir} | count={len(wavetable_files)} | seed={'RANDOM' if self.seed==0 else self.seed}"
+            )
             self.progress.emit(1)
 
             total = len(files)
@@ -630,7 +746,7 @@ class AudioWorker(QObject):
 class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("Restaurador por Síntesis (4 bandas + timbre match) — Random REAL")
+        self.setWindowTitle("Restaurador por Síntesis (4 bandas + timbre match + groove match) — Random REAL")
         self.resize(980, 720)
 
         central = QWidget()
@@ -754,6 +870,12 @@ class MainWindow(QMainWindow):
         self.gain_spin.setSingleStep(0.1)
         self.gain_spin.setValue(1.0)
 
+        # NUEVO: Groove accent
+        self.groove_amount = QDoubleSpinBox()
+        self.groove_amount.setRange(0.0, 1.0)
+        self.groove_amount.setSingleStep(0.05)
+        self.groove_amount.setValue(DEFAULT_GROOVE_AMOUNT)
+
         a.addWidget(QLabel("Hop:"))
         a.addWidget(self.hop_spin)
         a.addSpacing(10)
@@ -767,6 +889,9 @@ class MainWindow(QMainWindow):
         a.addSpacing(10)
         a.addWidget(QLabel("Gain:"))
         a.addWidget(self.gain_spin)
+        a.addSpacing(10)
+        a.addWidget(QLabel("Groove accent:"))
+        a.addWidget(self.groove_amount)
         a.addStretch()
 
         layout.addWidget(gb_an)
@@ -841,7 +966,10 @@ class MainWindow(QMainWindow):
     # --------- pickers ---------
     def pick_input_file(self):
         path, _ = QFileDialog.getOpenFileName(
-            self, "Seleccionar audio fuente", "", "Audio files (*.wav *.flac *.ogg *.mp3 *.aiff *.m4a);;Todos (*.*)"
+            self,
+            "Seleccionar audio fuente",
+            "",
+            "Audio files (*.wav *.flac *.ogg *.mp3 *.aiff *.m4a);;Todos (*.*)",
         )
         if path:
             self.in_edit.setText(path)
@@ -917,6 +1045,7 @@ class MainWindow(QMainWindow):
             spec_smooth_bins=int(self.spec_smooth_bins.value()),
             spec_clamp_lo=float(self.spec_clamp_lo.value()),
             spec_clamp_hi=float(self.spec_clamp_hi.value()),
+            groove_amount=float(self.groove_amount.value()),  # NUEVO
         )
         self.worker.moveToThread(self.thread)
 
@@ -948,6 +1077,7 @@ class MainWindow(QMainWindow):
 if __name__ == "__main__":
     app = QApplication(sys.argv)
     import qdarkstyle
+
     app.setStyleSheet(qdarkstyle.load_stylesheet(qt_api="pyside6"))
 
     w = MainWindow()
