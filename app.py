@@ -280,25 +280,20 @@ def compute_groove_env_from_env_bands(
     if env_bands.ndim != 2 or env_bands.shape[0] < 1:
         return np.ones((env_bands.shape[-1],), dtype=np.float32) if env_bands.ndim == 2 else np.ones((1,), dtype=np.float32)
 
-    # 1) Envolvente "global": promedio de bandas (ya normalizadas)
     env_global = np.mean(env_bands, axis=0).astype(np.float32)
     n = len(env_global)
     if n < 3:
         return np.ones(n, dtype=np.float32)
 
-    # 2) Delta positivo (onset strength aproximado)
     diff = env_global[1:] - env_global[:-1]
     onset_strength = np.maximum(diff, 0.0)
-    onset_strength = np.concatenate([[0.0], onset_strength])  # alineamos
+    onset_strength = np.concatenate([[0.0], onset_strength])
 
-    # 3) Normalizamos
     mx = float(np.max(onset_strength) + 1e-12)
     onset_strength = onset_strength / mx
 
-    # 4) Umbral relativo
     thr = float(np.mean(onset_strength) + onset_sensitivity * np.std(onset_strength))
 
-    # 5) Peak picking simple con distancia mínima
     peaks = []
     last_peak = -int(min_interval_frames)
     for i in range(1, n - 1):
@@ -314,7 +309,6 @@ def compute_groove_env_from_env_bands(
 
     groove_env = np.zeros(n, dtype=np.float32)
 
-    # 6) ataque + decay (solo decay hacia adelante, práctico y estable)
     decay_frames = int(max(1, decay_frames))
     for p in peaks:
         groove_env[p] = 1.0
@@ -326,7 +320,6 @@ def compute_groove_env_from_env_bands(
             if val > groove_env[j]:
                 groove_env[j] = val
 
-    # fallback si no encontró picos
     if len(peaks) == 0:
         groove_env[:] = env_global
         mx2 = float(np.max(groove_env) + 1e-12)
@@ -478,6 +471,169 @@ def spectral_envelope_match(
     return np.clip(y_out, -1.0, 1.0).astype(np.float32, copy=False)
 
 
+# ----------------- NEW: BAND SPECTRAL PROFILE MATCH (MEL TRI FBANK + TRANSIENT AWARE) -----------------
+
+def hz_to_mel(f_hz: float) -> float:
+    return 2595.0 * np.log10(1.0 + f_hz / 700.0)
+
+
+def mel_to_hz(m_mel: float) -> float:
+    return 700.0 * (10.0 ** (m_mel / 2595.0) - 1.0)
+
+
+def make_mel_tri_filterbank(
+    sr: int,
+    n_fft: int,
+    n_bands: int = 64,
+    fmin: float = 30.0,
+    fmax: float | None = None,
+) -> np.ndarray:
+    """
+    Devuelve fb: (n_bands, n_bins) donde n_bins = n_fft//2+1
+    Triangulos tipo mel. Sin dependencias extra.
+    """
+    if fmax is None:
+        fmax = float(sr) / 2.0
+
+    n_bins = n_fft // 2 + 1
+    freqs = np.linspace(0.0, sr / 2.0, n_bins, dtype=np.float32)
+
+    m_min = hz_to_mel(float(fmin))
+    m_max = hz_to_mel(float(fmax))
+    m_pts = np.linspace(m_min, m_max, n_bands + 2, dtype=np.float32)
+    f_pts = mel_to_hz(m_pts).astype(np.float32)
+
+    fb = np.zeros((n_bands, n_bins), dtype=np.float32)
+
+    for b in range(n_bands):
+        f_l = f_pts[b]
+        f_c = f_pts[b + 1]
+        f_r = f_pts[b + 2]
+
+        left = (freqs - f_l) / max(1e-6, (f_c - f_l))
+        right = (f_r - freqs) / max(1e-6, (f_r - f_c))
+        w = np.maximum(0.0, np.minimum(left, right)).astype(np.float32)
+        fb[b] = w
+
+    fb /= (np.sum(fb, axis=1, keepdims=True) + 1e-9)
+    return fb
+
+
+def smooth_gains_attack_release(
+    G: np.ndarray,  # (bands, frames)
+    alpha_attack: float,
+    alpha_release: float,
+) -> np.ndarray:
+    """
+    Suaviza por tiempo con AR:
+      si sube -> attack (rápido)
+      si baja -> release (lento)
+    one-pole por banda.
+    """
+    G = np.asarray(G, dtype=np.float32)
+    bands, frames = G.shape
+    out = np.empty_like(G, dtype=np.float32)
+    out[:, 0] = G[:, 0]
+    aA = float(np.clip(alpha_attack, 1e-6, 1.0))
+    aR = float(np.clip(alpha_release, 1e-6, 1.0))
+
+    for t in range(1, frames):
+        x = G[:, t]
+        y_prev = out[:, t - 1]
+        up = x > y_prev
+        a = np.where(up, aA, aR).astype(np.float32)
+        out[:, t] = a * x + (1.0 - a) * y_prev
+    return out
+
+
+def ms_to_alpha(ms: float, hop_length: int, sr: int) -> float:
+    """
+    Convierte tiempo (ms) a alpha de one-pole:
+      alpha = 1 - exp(-hop / tau)
+    """
+    ms = max(0.1, float(ms))
+    tau = ms / 1000.0
+    hop_s = float(hop_length) / float(sr)
+    alpha = 1.0 - np.exp(-hop_s / max(1e-9, tau))
+    return float(np.clip(alpha, 1e-6, 1.0))
+
+
+def spectral_profile_match_bands(
+    y_syn: np.ndarray,
+    sr: int,
+    spec_src_mag: np.ndarray,  # (bins, frames) del ORIGINAL (idealmente algo suavizado)
+    frame_length: int,
+    hop_length: int,
+    n_bands: int = 64,
+    strength: float = 0.8,
+    clamp_lo: float = 0.25,
+    clamp_hi: float = 4.0,
+    attack_ms: float = 10.0,
+    release_ms: float = 80.0,
+    groove_env: np.ndarray | None = None,  # (frames,) 0..1
+    transient_reduce: float = 0.8,  # cuánto baja strength en golpes
+):
+    """
+    Quasi-vocoder: iguala 'color' en B bandas, con smoothing temporal.
+    Transient-aware: reduce strength en frames de golpe según groove_env.
+    """
+    strength = float(np.clip(strength, 0.0, 1.5))
+    if strength <= 0.0:
+        return y_syn.astype(np.float32, copy=False)
+
+    n_fft = frame_length
+    S = lr_stft(
+        y_syn.astype(np.float32),
+        n_fft=n_fft,
+        hop_length=hop_length,
+        win_length=frame_length,
+        center=True,
+    )
+    mag = np.abs(S).astype(np.float32)
+    phase = np.angle(S).astype(np.float32)
+
+    bins_syn, frames_syn = mag.shape
+    bins_src, frames_src = spec_src_mag.shape
+    bins = min(bins_syn, bins_src)
+    frames = min(frames_syn, frames_src)
+
+    mag_use = mag[:bins, :frames]
+    ph_use = phase[:bins, :frames]
+    src_use = spec_src_mag[:bins, :frames]
+
+    fb = make_mel_tri_filterbank(sr=sr, n_fft=n_fft, n_bands=int(n_bands), fmin=30.0, fmax=sr / 2.0)
+    fb = fb[:, :bins]
+
+    E_syn = fb @ mag_use
+    E_src = fb @ src_use
+
+    ratio = E_src / (E_syn + 1e-9)
+    ratio = np.clip(ratio, 1e-4, 1e4).astype(np.float32)
+
+    if groove_env is not None and len(groove_env) >= frames:
+        g = np.clip(groove_env[:frames].astype(np.float32), 0.0, 1.0)
+        st_t = strength * (1.0 - float(np.clip(transient_reduce, 0.0, 1.0)) * g)
+    else:
+        st_t = np.full((frames,), strength, dtype=np.float32)
+
+    G_band = np.power(ratio, st_t[None, :]).astype(np.float32)
+    G_band = np.clip(G_band, float(clamp_lo), float(clamp_hi)).astype(np.float32)
+
+    aA = ms_to_alpha(attack_ms, hop_length, sr)
+    aR = ms_to_alpha(release_ms, hop_length, sr)
+    G_band = smooth_gains_attack_release(G_band, alpha_attack=aA, alpha_release=aR)
+
+    W = fb.T  # (bins, bands)
+    denom = (W @ np.ones((W.shape[1],), dtype=np.float32)).astype(np.float32)
+    G_bin = (W @ G_band) / (denom[:, None] + 1e-9)
+    G_bin = np.clip(G_bin, float(clamp_lo), float(clamp_hi)).astype(np.float32)
+
+    mag_out = (mag_use * G_bin).astype(np.float32)
+    S_out = mag_out * (np.cos(ph_use) + 1j * np.sin(ph_use))
+    y_out = lr_istft(S_out, hop_length=hop_length, win_length=frame_length, center=True, length=len(y_syn))
+    return np.clip(np.asarray(y_out, dtype=np.float32), -1.0, 1.0)
+
+
 # ----------------- FILE LISTING -----------------
 
 def list_wav_files(folder: str, recursive: bool = True):
@@ -554,7 +710,7 @@ class AudioWorker(QObject):
         self.spec_clamp_lo = float(spec_clamp_lo)
         self.spec_clamp_hi = float(spec_clamp_hi)
 
-        self.groove_amount = float(np.clip(groove_amount, 0.0, 1.0))  # NUEVO
+        self.groove_amount = float(np.clip(groove_amount, 0.0, 1.0))
 
         self._mipmap_cache = {}
 
@@ -585,19 +741,20 @@ class AudioWorker(QObject):
             spec_smooth_bins=self.spec_smooth_bins,
         )
 
-        # ---- GROOVE MATCH (onsets) ----
+        # 1) groove_env SIEMPRE (lo usamos también para transient-aware del spectral match)
+        groove_env = compute_groove_env_from_env_bands(
+            env_bands,
+            onset_sensitivity=1.5,
+            min_interval_frames=4,
+            decay_frames=8,
+        )
+
+        # 2) Groove accent para las envolventes (opcional)
         groove_amt = float(np.clip(self.groove_amount, 0.0, 1.0))
         if groove_amt > 0.0:
-            groove_env = compute_groove_env_from_env_bands(
-                env_bands,
-                onset_sensitivity=1.5,
-                min_interval_frames=4,
-                decay_frames=8,
-            )
-            self.log.emit(f"  Groove match: ON | amount={groove_amt:.2f}")
+            self.log.emit(f"  Groove accent: ON | amount={groove_amt:.2f}")
         else:
-            groove_env = None
-            self.log.emit("  Groove match: OFF")
+            self.log.emit("  Groove accent: OFF")
 
         picks = rng.choice(wavetable_files, size=4, replace=(len(wavetable_files) < 4))
         layers = []
@@ -610,8 +767,7 @@ class AudioWorker(QObject):
             mip = float(rng.uniform(self.mip_min, self.mip_max))
 
             env_band = env_bands[i]
-            if groove_env is not None:
-                # env_final = env_band * (1 - groove_amount + groove_amount * groove_env)
+            if groove_amt > 0.0:
                 env_frames = env_band * ((1.0 - groove_amt) + groove_amt * groove_env)
             else:
                 env_frames = env_band
@@ -635,17 +791,22 @@ class AudioWorker(QObject):
         mix = (mix / mx * 0.95).astype(np.float32)
 
         if self.enable_spec_match:
-            self.log.emit("  Aplicando spectral envelope match (timbre)...")
-            mix = spectral_envelope_match(
+            # Nuevo: perfil espectral por bandas + transient-aware usando groove_env
+            self.log.emit("  Aplicando spectral profile match (bandas + transient-aware)...")
+            mix = spectral_profile_match_bands(
                 y_syn=mix,
                 sr=sr,
-                spec_env_src=spec_env,
+                spec_src_mag=spec_env,  # <- del original (suavizado)
                 frame_length=self.frame_length,
                 hop_length=self.hop_length,
-                spec_smooth_bins=self.spec_smooth_bins,
+                n_bands=64,
                 strength=self.spec_strength,
                 clamp_lo=self.spec_clamp_lo,
                 clamp_hi=self.spec_clamp_hi,
+                attack_ms=10.0,
+                release_ms=80.0,
+                groove_env=groove_env,
+                transient_reduce=0.8,
             )
 
         if self.output_gain != 1.0:
@@ -667,22 +828,18 @@ class AudioWorker(QObject):
             if len(wavetable_files) == 0:
                 raise RuntimeError("No se encontraron .wav en la carpeta de wavetables (incl. subcarpetas).")
 
-            # ✅ RNG: si seed=0 => azar total (entropy del sistema)
             rng = np.random.default_rng(None if self.seed == 0 else self.seed)
 
             is_batch = os.path.isdir(inp)
 
             if not is_batch:
-                # SINGLE
                 if not os.path.isfile(inp):
                     raise RuntimeError("Input single debe ser un archivo.")
 
-                # Si output es carpeta, guardamos ahí con nombre automático
                 if os.path.isdir(outp):
                     base = os.path.splitext(os.path.basename(inp))[0]
                     out_file = os.path.join(outp, base + "__restored.wav")
                 else:
-                    # si no tiene extensión, asumimos carpeta y la creamos
                     if os.path.splitext(outp)[1].lower() != ".wav":
                         os.makedirs(outp, exist_ok=True)
                         base = os.path.splitext(os.path.basename(inp))[0]
@@ -700,7 +857,6 @@ class AudioWorker(QObject):
                 self.finished.emit()
                 return
 
-            # BATCH
             in_dir = inp
             out_dir = outp
             if os.path.isfile(out_dir):
@@ -731,7 +887,6 @@ class AudioWorker(QObject):
                 p = int(5 + 90 * (idx / max(1, total)))
                 self.progress.emit(p)
 
-                # ✅ RNG continuo: completamente random a lo largo del batch
                 self._process_one(src_file, out_file, wavetable_files, rng)
 
             self.progress.emit(100)
@@ -746,7 +901,7 @@ class AudioWorker(QObject):
 class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("Restaurador por Síntesis (4 bandas + timbre match + groove match) — Random REAL")
+        self.setWindowTitle("Restaurador por Síntesis (4 bandas + band profile match + groove) — Random REAL")
         self.resize(980, 720)
 
         central = QWidget()
@@ -756,7 +911,7 @@ class MainWindow(QMainWindow):
         layout.setContentsMargins(15, 15, 15, 15)
         layout.setSpacing(10)
 
-        # Input / Output (con botones separados archivo/carpeta)
+        # Input / Output
         self.in_edit = QLineEdit()
         self.out_edit = QLineEdit()
 
@@ -870,7 +1025,6 @@ class MainWindow(QMainWindow):
         self.gain_spin.setSingleStep(0.1)
         self.gain_spin.setValue(1.0)
 
-        # NUEVO: Groove accent
         self.groove_amount = QDoubleSpinBox()
         self.groove_amount.setRange(0.0, 1.0)
         self.groove_amount.setSingleStep(0.05)
@@ -896,15 +1050,15 @@ class MainWindow(QMainWindow):
 
         layout.addWidget(gb_an)
 
-        # Spectral match
-        gb_sm = QGroupBox("Spectral envelope match (timbre / EQ dinámica)")
+        # Spectral match (ahora usa "band profile match")
+        gb_sm = QGroupBox("Spectral profile match (bandas / EQ dinámica transient-aware)")
         s = QHBoxLayout(gb_sm)
 
         self.spec_enable = QCheckBox("Activar")
         self.spec_enable.setChecked(True)
 
         self.spec_strength = QDoubleSpinBox()
-        self.spec_strength.setRange(0.0, 1.0)
+        self.spec_strength.setRange(0.0, 1.5)
         self.spec_strength.setSingleStep(0.05)
         self.spec_strength.setValue(0.7)
 
@@ -927,7 +1081,7 @@ class MainWindow(QMainWindow):
         s.addWidget(QLabel("Strength:"))
         s.addWidget(self.spec_strength)
         s.addSpacing(10)
-        s.addWidget(QLabel("Smooth bins:"))
+        s.addWidget(QLabel("Smooth bins (para spec_env):"))
         s.addWidget(self.spec_smooth_bins)
         s.addSpacing(10)
         s.addWidget(QLabel("Clamp lo:"))
@@ -1045,7 +1199,7 @@ class MainWindow(QMainWindow):
             spec_smooth_bins=int(self.spec_smooth_bins.value()),
             spec_clamp_lo=float(self.spec_clamp_lo.value()),
             spec_clamp_hi=float(self.spec_clamp_hi.value()),
-            groove_amount=float(self.groove_amount.value()),  # NUEVO
+            groove_amount=float(self.groove_amount.value()),
         )
         self.worker.moveToThread(self.thread)
 
@@ -1083,5 +1237,4 @@ if __name__ == "__main__":
     w = MainWindow()
     w.show()
     sys.exit(app.exec())
-
 
